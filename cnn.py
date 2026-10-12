@@ -5,6 +5,7 @@ import numpy as np
 import tensorflow as tf
 from sklearn.model_selection import train_test_split
 from keras import layers, models
+from collections import deque
 
 # --- UPDATED MEDIAPIPE IMPORTS (v0.10.14+) ---
 import mediapipe as mp
@@ -14,7 +15,8 @@ from mediapipe.python.solutions import drawing_utils as mp_drawing
 # --- CONFIGURATION ---
 DATA_FILE = "asl_dataset.json"
 INPUT_SHAPE = (21, 3, 1)  
-CLASSES = ["B", "C", "D", "E", "F", "I", "K", "L", "O", "U", "V", "W", "Y"]  
+CLASSES = ["A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", 
+           "L", "M", "N", "O", "P", "Q", "R", "S", "T", "U", "V", "W", "X", "Y", "Z"]
 
 # Initialize Hands detector
 hands = mp_hands.Hands(
@@ -27,7 +29,16 @@ hands = mp_hands.Hands(
 def collect_data():
     """Captures hand landmarks from the webcam to build a dataset."""
     cap = cv2.VideoCapture(0)
-    dataset = {label: [] for label in CLASSES}
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r') as f:
+            dataset = json.load(f)
+        for label in CLASSES:
+            if label not in dataset:
+                dataset[label] = []
+        print(f"Loaded existing dataset from {DATA_FILE}")
+    else:
+        dataset = {label: [] for label in CLASSES}
+        print("Starting new dataset...")
    
     print("--- ASL Data Collection ---")
     print("Press the corresponding letter key on your keyboard to save a frame.")
@@ -140,26 +151,30 @@ def train_model():
     print("\nTraining CNN Model...")
     model.fit(
         X_train, y_train,
-        epochs=30,
+        epochs=50,
         validation_data=(X_test, y_test),
         batch_size=8
     )
    
     return model
 
-# --- 3. REAL-TIME TRANSLATION ---
+# --- 3. REAL-TIME TRANSLATION WITH FIXED TOP-RIGHT DISPLAY ---
 def run_inference(model):
-    """Uses the trained model to translate signs in real-time."""
+    """Uses the trained model to translate signs in real-time with prediction smoothing."""
     cap = cv2.VideoCapture(0)
     print("\n--- Real-Time ASL Translation Started ---")
     print("Press 'q' to exit.")
-   
+    
+    # Prediction buffer: holds probabilities from the last 5 frames
+    prediction_buffer = deque(maxlen=5)
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
            
         frame = cv2.flip(frame, 1)
+        h, w, _ = frame.shape  # h = height, w = width
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = hands.process(rgb_frame)
        
@@ -183,19 +198,58 @@ def run_inference(model):
                 
                 input_data = np.array(landmarks, dtype=np.float32).reshape(1, 21, 3, 1)
                
-                predictions = model.predict(input_data, verbose=0)
-                class_idx = np.argmax(predictions)
-                confidence = predictions[0][class_idx]
+                raw_predictions = model.predict(input_data, verbose=0)[0]
+                prediction_buffer.append(raw_predictions)
+                
+                # Average probabilities across the window
+                smoothed_predictions = np.mean(prediction_buffer, axis=0)
+                class_idx = np.argmax(smoothed_predictions)
+                confidence = smoothed_predictions[class_idx]
                
                 if confidence > 0.75:
                     prediction_text = f"Letter: {CLASSES[class_idx]} ({confidence*100:.1f}%)"
                 else:
                     prediction_text = "Uncertain..."
-                   
-        cv2.putText(
-            frame, prediction_text, (20, 50),
-            cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA
+        else:
+            # Clear buffer when no hand is in view
+            prediction_buffer.clear()
+
+        # Render Top-Right Display
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.7
+        thickness = 2
+        padding = 20
+
+        # Calculate exact text dimensions
+        (text_w, text_h), baseline = cv2.getTextSize(
+            prediction_text, font, font_scale, thickness
         )
+        
+        # Absolute top-right pixel coordinates
+        x_pos = int(w - text_w - padding)
+        y_pos = int(text_h + padding)
+
+        # Draw background box for readability
+        cv2.rectangle(
+            frame,
+            (x_pos - 10, y_pos - text_h - 10),
+            (x_pos + text_w + 10, y_pos + baseline + 10),
+            (0, 0, 0),
+            -1
+        )
+
+        # Draw prediction text inside top-right bounds
+        cv2.putText(
+            frame, 
+            prediction_text, 
+            (x_pos, y_pos),
+            font, 
+            font_scale, 
+            (0, 255, 0), 
+            thickness, 
+            cv2.LINE_AA
+        )
+
         cv2.imshow("ASL to English Translator", frame)
        
         if cv2.waitKey(1) & 0xFF in (ord('q'), ord('Q')):
